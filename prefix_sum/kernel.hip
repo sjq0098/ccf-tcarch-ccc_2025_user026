@@ -1,126 +1,155 @@
 #include "main.h"
+#include <hip/hip_runtime.h>
+#include <cstring>
 
-/*
-Blocked inclusive scan (prefix sum) on GPU using hierarchical approach:
-1) Per-block inclusive scan into output and write each block's total into blockSums
-2) Recursively inclusive-scan blockSums, shift to exclusive offsets
-3) Add exclusive block offsets to each element of its block in output
-*/
-
+// Block-inclusive scan kernel (Blelloch, using shared memory, pads to next pow2)
 __global__ void blockInclusiveScanKernel(const int* __restrict__ d_in,
                                          int* __restrict__ d_out,
                                          int* __restrict__ d_blockSums,
                                          int N) {
-    extern __shared__ int sdata[];
+    extern __shared__ int sdata[]; // will be allocated with nextPow2(blockSize) ints
 
     int tid = threadIdx.x;
     int blockStart = blockIdx.x * blockDim.x;
-    int gid = blockStart + tid;
+    int gid_base = blockStart; // base for this block
 
+    // number of valid items in this block
     int nInBlock = blockDim.x;
     int remaining = N - blockStart;
-    if (remaining < nInBlock) nInBlock = max(remaining, 0);
+    if (remaining < nInBlock) nInBlock = remaining > 0 ? remaining : 0;
 
-    int x = 0;
-    if (tid < nInBlock) {
-        x = d_in[gid];
+    // compute nPow2 (next power of two >= blockDim.x)
+    int nPow2 = 1;
+    while (nPow2 < blockDim.x) nPow2 <<= 1;
+
+    // initialize shared memory (some threads may need to write multiple slots)
+    for (int i = tid; i < nPow2; i += blockDim.x) {
+        int srcIdx = gid_base + i;
+        sdata[i] = (i < nInBlock && srcIdx < N) ? d_in[srcIdx] : 0;
     }
-    sdata[tid] = (tid < nInBlock) ? x : 0;
     __syncthreads();
 
-    // Hillis-Steele inclusive scan within a block
-    for (int offset = 1; offset < blockDim.x; offset <<= 1) {
-        int addend = 0;
-        if (tid < nInBlock && tid >= offset) {
-            addend = sdata[tid - offset];
-        }
-        __syncthreads();
-        if (tid < nInBlock) {
-            sdata[tid] += addend;
+    // Upsweep (reduce) phase
+    for (int d = 1; d < nPow2; d <<= 1) {
+        int stride = d << 1; // 2*d
+        // each thread handles multiple positions spaced by blockDim.x
+        for (int i = tid; i < nPow2 / stride; i += blockDim.x) {
+            int idx = i * stride + stride - 1;
+            int left = idx - d;
+            // idx and left < nPow2 by construction
+            sdata[idx] += sdata[left];
         }
         __syncthreads();
     }
 
-    if (tid < nInBlock) {
-        d_out[gid] = sdata[tid];
+    // set last element to 0 for downsweep (exclusive scan)
+    if (tid == 0) {
+        // sdata[nPow2-1] currently holds total sum
+        // keep it for potential block sum retrieval later, but set to 0 for downsweep
+        sdata[nPow2 - 1] = 0;
+    }
+    __syncthreads();
+
+    // Downsweep phase
+    for (int d = nPow2 >> 1; d >= 1; d >>= 1) {
+        int stride = d << 1;
+        for (int i = tid; i < nPow2 / stride; i += blockDim.x) {
+            int idx = i * stride + stride - 1;
+            int left = idx - d;
+            int t = sdata[left];
+            sdata[left] = sdata[idx];
+            sdata[idx] += t;
+        }
+        __syncthreads();
     }
 
-    if (d_blockSums && nInBlock > 0 && tid == nInBlock - 1) {
-        d_blockSums[blockIdx.x] = sdata[tid];
+    // Now sdata[i] is the EXCLUSIVE prefix sum for element i.
+    // inclusive = exclusive + original_value
+    for (int i = tid; i < nInBlock; i += blockDim.x) {
+        int gid = gid_base + i;
+        int orig = (gid < N) ? d_in[gid] : 0;
+        int inclusive = sdata[i] + orig;
+        d_out[gid] = inclusive;
+
+        // last valid element writes block sum
+        if (d_blockSums && i == (nInBlock - 1)) {
+            d_blockSums[blockIdx.x] = inclusive;
+        }
     }
 }
 
+// Modified addOffsetsKernel: read previous-block inclusive sums directly
+// d_blockSumsInclusive is the inclusive prefix sums of each block.
+// For block b, offset = (b == 0 ? 0 : d_blockSumsInclusive[b - 1])
 __global__ void addOffsetsKernel(int* __restrict__ d_data,
-                                 const int* __restrict__ d_blockOffsets,
+                                 const int* __restrict__ d_blockSumsInclusive,
                                  int N) {
     int gid = blockIdx.x * blockDim.x + threadIdx.x;
     if (gid < N) {
-        int blockId = blockIdx.x;
-        d_data[gid] += d_blockOffsets[blockId];
+        int b = blockIdx.x;
+        int offset = 0;
+        if (b > 0) {
+            offset = d_blockSumsInclusive[b - 1];
+        }
+        d_data[gid] += offset;
     }
 }
 
-__global__ void shiftRightExclusiveKernel(const int* __restrict__ d_inInclusive,
-                                          int* __restrict__ d_outExclusive,
-                                          int N) {
-    int gid = blockIdx.x * blockDim.x + threadIdx.x;
-    if (gid < N) {
-        int val = (gid == 0) ? 0 : d_inInclusive[gid - 1];
-        d_outExclusive[gid] = val;
-    }
+// Helper: next power of two on host
+static inline int nextPow2Host(int x) {
+    int p = 1;
+    while (p < x) p <<= 1;
+    return p;
 }
 
+// Recursively inclusive-scan device array (same signature as original)
 static void scanInclusiveDevice(const int* d_in, int* d_out, int N, int blockSize) {
     if (N <= 0) return;
 
     int numBlocks = (N + blockSize - 1) / blockSize;
 
+    // compute shared mem bytes for per-block kernel: nextPow2(blockSize) ints
+    int nPow2 = nextPow2Host(blockSize);
+    size_t shm = static_cast<size_t>(nPow2) * sizeof(int);
+
     if (numBlocks == 1) {
         // Single-block inclusive scan; no block sums needed
-        size_t shm = static_cast<size_t>(blockSize) * sizeof(int);
         dim3 grid(1), block(blockSize);
+        // launch with shm sized to nPow2*sizeof(int)
         blockInclusiveScanKernel<<<grid, block, shm>>>(d_in, d_out, nullptr, N);
-        hipDeviceSynchronize();
         return;
     }
 
-    // Multi-block case: per-block scan + scan block sums + add offsets
+    // Multi-block: per-block scan + scan block sums + add offsets
     int* d_blockSums = nullptr;
     hipMalloc(&d_blockSums, sizeof(int) * numBlocks);
 
-    size_t shm = static_cast<size_t>(blockSize) * sizeof(int);
-    dim3 grid(numBlocks), block(blockSize);
-    blockInclusiveScanKernel<<<grid, block, shm>>>(d_in, d_out, d_blockSums, N);
-    hipDeviceSynchronize();
+    {
+        dim3 grid(numBlocks), block(blockSize);
+        blockInclusiveScanKernel<<<grid, block, shm>>>(d_in, d_out, d_blockSums, N);
+    }
 
     // Recursively inclusive-scan blockSums
     int* d_blockSumsInclusive = nullptr;
     hipMalloc(&d_blockSumsInclusive, sizeof(int) * numBlocks);
     scanInclusiveDevice(d_blockSums, d_blockSumsInclusive, numBlocks, blockSize);
 
-    // Convert to exclusive offsets: offset[k] = inclusive[k-1], offset[0] = 0
-    int* d_blockOffsets = nullptr;
-    hipMalloc(&d_blockOffsets, sizeof(int) * numBlocks);
+    // ----- REPLACED: no shift kernel, no d_blockOffsets malloc -----
+    // Add offsets to each element of its block by directly reading d_blockSumsInclusive[blockId-1]
     {
-        int shiftBlock = 256;
-        int shiftGrid = (numBlocks + shiftBlock - 1) / shiftBlock;
-        shiftRightExclusiveKernel<<<shiftGrid, shiftBlock>>>(d_blockSumsInclusive, d_blockOffsets, numBlocks);
+        dim3 grid(numBlocks), block(blockSize);
+        addOffsetsKernel<<<grid, block>>>(d_out, d_blockSumsInclusive, N);
     }
-    hipDeviceSynchronize();
-
-    // Add offsets to each element of its block
-    addOffsetsKernel<<<grid, block>>>(d_out, d_blockOffsets, N);
-    hipDeviceSynchronize();
 
     hipFree(d_blockSums);
     hipFree(d_blockSumsInclusive);
-    hipFree(d_blockOffsets);
 }
 
+// Host entry (unchanged)
 extern "C" void solve(const int* input, int* output, int N) {
     if (N <= 0) return;
 
-    const int BLOCK_SIZE = 1024; // tuned for common GPUs
+    const int BLOCK_SIZE = 1024; // original default; you can tune this
 
     int *d_in = nullptr, *d_out = nullptr;
     hipMalloc(&d_in, sizeof(int) * N);

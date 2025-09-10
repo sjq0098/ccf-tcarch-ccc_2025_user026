@@ -1,8 +1,88 @@
 // HIP-based blocked Floyd–Warshall APSP
 #include "main.h"
+
 #define INFI 1073741823
 
 using namespace std;
+
+// Fast I/O (fread/fwrite based)
+struct FastInput {
+    static const size_t BUFFER_SIZE = 1 << 20; // 1MB
+    FILE *file;
+    char buffer[BUFFER_SIZE];
+    size_t index;
+    size_t size;
+
+    explicit FastInput(FILE *f) : file(f), index(0), size(0) {}
+
+    inline void refill() {
+        if (index < size) return;
+        size = fread(buffer, 1, BUFFER_SIZE, file);
+        index = 0;
+    }
+
+    inline bool skipBlanks() {
+        for (;;) {
+            refill();
+            if (index >= size) return false;
+            if (buffer[index] > ' ') return true;
+            ++index;
+        }
+    }
+
+    inline bool readInt(int &out) {
+        if (!skipBlanks()) return false;
+        bool neg = false;
+        if (buffer[index] == '-') { neg = true; ++index; }
+        long long val = 0;
+        for (;;) {
+            refill();
+            if (index >= size) break;
+            char c = buffer[index];
+            if (c < '0' || c > '9') { ++index; break; }
+            val = val * 10 + (c - '0');
+            ++index;
+        }
+        out = neg ? -(int)val : (int)val;
+        return true;
+    }
+};
+
+struct FastOutput {
+    static const size_t BUFFER_SIZE = 1 << 20; // 1MB
+    char buffer[BUFFER_SIZE];
+    size_t index;
+
+    FastOutput() : index(0) {}
+    ~FastOutput() { flush(); }
+
+    inline void flush() {
+        if (index) {
+            fwrite(buffer, 1, index, stdout);
+            index = 0;
+        }
+    }
+
+    inline void pushChar(char c) {
+        if (index >= BUFFER_SIZE) flush();
+        buffer[index++] = c;
+    }
+
+    inline void writeUnsigned(unsigned int x) {
+        if (x == 0) { pushChar('0'); return; }
+        char tmp[16];
+        int n = 0;
+        while (x) { tmp[n++] = char('0' + (x % 10)); x /= 10; }
+        while (n--) pushChar(tmp[n]);
+    }
+
+    inline void writeInt(int x) {
+        if (x < 0) { pushChar('-'); writeUnsigned((unsigned int)(-(long long)x)); }
+        else { writeUnsigned((unsigned int)x); }
+    }
+
+    inline void writeChar(char c) { pushChar(c); }
+};
 
 static inline __device__ __host__ int min_with_inf_guard(int a, int b) {
     return (a < b) ? a : b;
@@ -189,18 +269,18 @@ __global__ void fw_phase3(int *dist, int v, int bsize, int round, int numTiles) 
 }
 
 int main(int argc, char* argv[]){
-    ios::sync_with_stdio(false);
-    cin.tie(nullptr);
-
-    istream *in = &cin;
-    ifstream fin;
+    FILE *fin = stdin;
     if (argc >= 2) {
-        fin.open(argv[1]);
-        if (fin.is_open()) in = &fin;
+        FILE *fp = fopen(argv[1], "rb");
+        if (fp) fin = fp;
     }
 
-    int v,e;
-    if(!(*in >> v >> e)){
+    FastInput in(fin);
+    FastOutput out;
+
+    int v, e;
+    if (!in.readInt(v) || !in.readInt(e)) {
+        if (fin && fin != stdin) fclose(fin);
         return 0;
     }
 
@@ -211,7 +291,9 @@ int main(int argc, char* argv[]){
 
     int src,dst,w;
     for(int i=0;i<e;i++){
-        *in >> src >> dst >> w;
+        in.readInt(src);
+        in.readInt(dst);
+        in.readInt(w);
         h_dist[static_cast<size_t>(src) * v + dst] = w;
     }
 
@@ -247,10 +329,12 @@ int main(int argc, char* argv[]){
 
     for(int i=0;i<v;i++){
         for(int j=0;j<v;j++){
-            if(j) cout << " ";
-            cout << h_dist[static_cast<size_t>(i) * v + j];
+            if(j) out.writeChar(' ');
+            out.writeInt(h_dist[static_cast<size_t>(i) * v + j]);
         }
-        cout << '\n';
+        out.writeChar('\n');
     }
+    out.flush();
+    if (fin && fin != stdin) fclose(fin);
     return 0;
 }

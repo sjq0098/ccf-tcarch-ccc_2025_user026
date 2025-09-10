@@ -6,5 +6,6 @@
 #include <vector>
 #include <hip/hip_runtime.h>
 #include <fstream>
+#include <cstdio>
 
 #endif 
